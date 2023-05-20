@@ -1,13 +1,45 @@
 import importlib
 import os
-from collections import OrderedDict
-from lib.test.evaluation.environment import env_settings
 import time
-import cv2 as cv
-
-from lib.utils.lmdb_utils import decode_img
+from collections import OrderedDict
 from pathlib import Path
+
+import cv2 as cv
 import numpy as np
+import requests
+from segment_anything import SamPredictor, sam_model_registry
+from skimage.measure import find_contours
+
+from lib.test.evaluation.environment import env_settings
+from lib.utils.lmdb_utils import decode_img
+
+SAM_MODELS = {
+  'vit_h': 'https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth',
+  'vit_l': 'https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth',
+  'vit_b': 'https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth'
+}
+
+
+def get_model(model_name):
+  """Downloads a model to ./sam_weights if it does not exist and return path to it.
+
+  Args:
+      model_name (str): SAM model name. One of ['vit_h', 'vit_l', 'vit_b'].
+  """
+  url = SAM_MODELS[model_name]
+  filename = url.split('/')[-1]
+  filepath = os.path.join('./sam_weights', filename)
+  if not os.path.exists(filepath):
+    os.makedirs('./sam_weights', exist_ok=True)
+    print(f'Downloading {url} to {filepath}')
+    r = requests.get(url, allow_redirects=True)
+    open(filepath, 'wb').write(r.content)
+
+  return filepath
+
+
+def get_polys(mask):
+  return [poly[:, ::-1].astype(np.int32) for poly in find_contours(mask, 0.5)]
 
 
 def trackerlist(name: str, parameter_name: str, dataset_name: str, run_ids = None, display_name: str = None,
@@ -34,7 +66,7 @@ class Tracker:
     """
 
     def __init__(self, name: str, parameter_name: str, dataset_name: str, run_id: int = None, display_name: str = None,
-                 result_only=False):
+                 result_only=False, sam_model=None):
         assert run_id is None or isinstance(run_id, int)
 
         self.name = name
@@ -42,6 +74,13 @@ class Tracker:
         self.dataset_name = dataset_name
         self.run_id = run_id
         self.display_name = display_name
+
+        if sam_model is not None:
+            sam_checkpoint = get_model(sam_model)
+            sam = sam_model_registry[sam_model](checkpoint=sam_checkpoint).cuda()
+            self.sam_predictor = SamPredictor(sam)
+        else:
+            self.sam_predictor = None
 
         env = env_settings()
         if self.run_id is None:
@@ -225,6 +264,14 @@ class Tracker:
             out = tracker.track(frame)
             state = [int(s) for s in out['target_bbox']]
             output_boxes.append(state)
+
+            if self.sam_predictor is not None:
+              self.sam_predictor.set_image(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
+              box_xyxy = np.array(state)
+              box_xyxy[2:] += box_xyxy[:2]
+              masks, _, _ = self.sam_predictor.predict(box=box_xyxy)
+              polygons = get_polys(masks.max(0))
+              cv.polylines(frame_disp, polygons, True, (255, 0, 0), 2)
 
             cv.rectangle(frame_disp, (state[0], state[1]), (state[2] + state[0], state[3] + state[1]),
                          (0, 255, 0), 5)
